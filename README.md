@@ -1,4 +1,3 @@
-# Grammarly-Clone-Extension
 Grammar-Clone-Extension is a lightweight Chrome extension that checks and corrects grammar, spelling, and punctuation errors in real-time while you type.
 It connects to a FastAPI backend powered by Google Gemini to fetch grammar suggestions and displays them in a simple popup interface.
 
