@@ -1,118 +1,103 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List
+from dotenv import load_dotenv
 import os
 import json
-import difflib
+import re
 import google.generativeai as genai
-from dotenv import load_dotenv
 import asyncio
 
+# --- Load environment variables from .env (local) ---
+load_dotenv()
+
+# --- FastAPI app ---
 app = FastAPI()
 
-# --- Configure Gemini ---
-GEMINI_KEY = "AIzaSyD94kQdwmAS_QFVOVU2MJhM0ttaP4oZ4Y0"
+# --- Gemini setup ---
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_KEY:
-    raise RuntimeError("Set GEMINI_API_KEY in environment")
+    raise RuntimeError("❌ Missing GEMINI_API_KEY — please set it in .env or environment variables")
 
 genai.configure(api_key=GEMINI_KEY)
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 model = genai.GenerativeModel(MODEL_NAME)
 
-# --- Data models ---
+# --- Request/Response Models ---
 class CheckRequest(BaseModel):
     text: str
     language: str = "auto"
 
-class Correction(BaseModel):
-    start: int
-    end: int
-    original: str
-    correction: str
-    message: str = ""
-
 class CheckResponse(BaseModel):
-    corrections: List[Correction]
-
-# --- Word-level diff helper ---
-def word_diff(original: str, corrected: str) -> List[Correction]:
-    orig_words = original.split()
-    corr_words = corrected.split()
-    s = difflib.SequenceMatcher(None, orig_words, corr_words)
-    corrections: List[Correction] = []
-
-    for tag, i1, i2, j1, j2 in s.get_opcodes():
-        if tag == "equal":
-            continue
-        corrections.append(
-            Correction(
-                start=i1,
-                end=i2,
-                original=" ".join(orig_words[i1:i2]),
-                correction=" ".join(corr_words[j1:j2]),
-                message="Suggested change",
-            )
-        )
-    return corrections
+    original: str
+    suggestion: str
+    explanation: str
 
 # --- API endpoint ---
 @app.post("/check", response_model=CheckResponse)
 async def check(req: CheckRequest):
     prompt = f"""
-You are a grammar and spelling correction assistant.
-Return ONLY a valid JSON like this:
+You are a professional English grammar assistant. Follow these strict rules exactly:
+1) Fix grammar, spelling, punctuation, and sentence structure so the output is one natural, fluent sentence.
+2) Ensure tense and verb agreement are consistent across clauses.
+3) Preserve the original meaning; do NOT invent new facts.
+4) Output only valid JSON and nothing else, in this exact shape:
 {{"corrected": "<corrected sentence>"}}
 
 Text: {req.text}
 """
-
     try:
-        # Add timeout to prevent very slow requests
         response = await asyncio.wait_for(
             model.generate_content_async(prompt),
-            timeout=10
+            timeout=30
         )
 
         raw = getattr(response, "text", None)
         if not raw and response.candidates:
             raw = response.candidates[0].content.parts[0].text
+
     except asyncio.TimeoutError:
-        print("Gemini request timed out.")
-        return CheckResponse(corrections=[])
+        return CheckResponse(
+            original=req.text,
+            suggestion=req.text,
+            explanation="⏳ Gemini request timed out, returned original text."
+        )
     except Exception as e:
-        print("Gemini error:", e)
-        return CheckResponse(corrections=[])
+        return CheckResponse(
+            original=req.text,
+            suggestion=req.text,
+            explanation=f"⚠ Gemini error: {e}, returned original text."
+        )
 
     if not raw:
-        return CheckResponse(corrections=[])
+        return CheckResponse(
+            original=req.text,
+            suggestion=req.text,
+            explanation="⚠ No response from Gemini, returned original text."
+        )
 
     raw = raw.strip()
-    print("RAW:", repr(raw))
 
-    # --- Strip code fences if Gemini returns JSON ---
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:].strip()
+    # --- Extract JSON safely ---
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    corrected = ""
 
-    # --- Parse JSON safely ---
-    try:
-        data = json.loads(raw)
-        corrected = data.get("corrected", "").strip()
-    except Exception:
+    if match:
+        json_str = match.group(0)
+        try:
+            data = json.loads(json_str)
+            corrected = data.get("corrected", "").strip()
+        except Exception:
+            corrected = raw.strip()
+    else:
         corrected = raw.strip()
 
-    original = req.text.strip()
-    print("ORIGINAL:", repr(original))
-    print("CORRECTED:", repr(corrected))
+    # --- Fallback if empty ---
+    if not corrected:
+        corrected = req.text.strip()
 
-    if not corrected or corrected == original:
-        return CheckResponse(corrections=[])
-
-    corrections = word_diff(original, corrected)
-    return CheckResponse(corrections=corrections)
-
-# --- Run server ---
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    return CheckResponse(
+        original=req.text,
+        suggestion=corrected,
+        explanation="✅ Grammar corrected"
+    )
